@@ -316,17 +316,17 @@ REGISTER_OP("system.sync_src")
 
 **Purpose**: Cross-core data transfer and pipe management between AIC (Cube) and AIV (Vector) kernels
 **Type**: `UnknownType` (push/init/buffer/free ops) or `TileType` passthrough (pop ops)
-**Location**: `src/ir/op/sync_ops/cross_core.cpp`
-**Python API**: `import pypto.language as pl` (promoted ops) or `from pypto.ir.op import system`
+**Location**: `src/ir/op/tile_ops/cross_core.cpp` (tpush/tpop) and `src/ir/op/sync_ops/cross_core.cpp` (tfree/pipe init/buffers)
+**Python API**: `import pypto.language as pl` (promoted ops) or `from pypto.ir.op import tile, system`
 
 ### Data Transfer Operations
 
 | Operation | Args | Description | Kwargs |
 | --------- | ---- | ----------- | ------ |
-| `system.tpush_to_aiv` | 1 (tile) | Push tile from Cube to Vector | `aiv_idx` |
-| `system.tpush_to_aic` | 1 (tile) | Push tile from Vector to Cube | `aiv_idx` |
-| `system.tpop_from_aic` | 0 | Pop tile from Cube pipe (→ TileType) | `aiv_idx` |
-| `system.tpop_from_aiv` | 0 | Pop tile from Vector pipe (→ TileType) | `aiv_idx` |
+| `tile.tpush_to_aiv` | 1 (tile) | Push tile from Cube to Vector | `aiv_idx` |
+| `tile.tpush_to_aic` | 1 (tile) | Push tile from Vector to Cube | `aiv_idx` |
+| `tile.tpop_from_aic` | 0 | Pop tile from Cube pipe (→ TileType) | `aiv_idx` |
+| `tile.tpop_from_aiv` | 0 | Pop tile from Vector pipe (→ TileType) | `aiv_idx` |
 | `system.tfree_to_aic` | 0 | Release slot back to Cube producer | `aiv_idx` |
 | `system.tfree_to_aiv` | 0 | Release slot back to Vector producer | `aiv_idx` |
 

@@ -162,18 +162,20 @@ CoreAffinity ClassifyCallAffinity(const CallPtr& call) {
     return CoreAffinity::VECTOR;  // default target_memory is Vec
   }
 
-  // Other tile.* ops are vector
-  if (name.substr(0, 5) == "tile.") return CoreAffinity::VECTOR;
-
-  // Cross-core ops: AIV-side ops are VECTOR, AIC-side ops are CUBE.
-  // reserve_buffer and import_peer_buffer are SHARED (used by both sides).
+  // Cross-core tile ops: must be checked before the generic tile.* branch.
+  // AIV-side ops are VECTOR, AIC-side ops are CUBE.
   static const std::unordered_set<std::string> vector_cross_core_ops = {
-      "system.aiv_initialize_pipe", "system.tpush_to_aic", "system.tfree_to_aic"};
+      "system.aiv_initialize_pipe", "system.tpush_to_aic", "system.tfree_to_aic", "tile.tpush_to_aic",
+      "tile.tpop_from_aic"};
   if (vector_cross_core_ops.count(name)) return CoreAffinity::VECTOR;
 
   static const std::unordered_set<std::string> cube_cross_core_ops = {
-      "system.aic_initialize_pipe", "system.tfree_to_aiv", "system.tpush_to_aiv"};
+      "system.aic_initialize_pipe", "system.tfree_to_aiv", "system.tpush_to_aiv", "tile.tpush_to_aiv",
+      "tile.tpop_from_aiv"};
   if (cube_cross_core_ops.count(name)) return CoreAffinity::CUBE;
+
+  // Other tile.* ops are vector
+  if (name.substr(0, 5) == "tile.") return CoreAffinity::VECTOR;
 
   return CoreAffinity::SHARED;
 }
@@ -329,9 +331,9 @@ std::string GetStmtOpName(const StmtPtr& stmt) {
 }
 
 bool IsSideEffectOp(const StmtPtr& stmt) {
-  static const std::unordered_set<std::string> side_effect_ops = {
-      "system.tpush_to_aiv",  "system.tpush_to_aic", "system.tpop_from_aic",
-      "system.tpop_from_aiv", "tile.store",          "tile.assemble"};
+  static const std::unordered_set<std::string> side_effect_ops = {"tile.tpush_to_aiv",  "tile.tpush_to_aic",
+                                                                  "tile.tpop_from_aic", "tile.tpop_from_aiv",
+                                                                  "tile.store",         "tile.assemble"};
   return side_effect_ops.count(GetStmtOpName(stmt)) > 0;
 }
 
@@ -896,8 +898,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
   // For boundary moves: the "push" side sends data, the "pop" side receives it.
   // AIC: C→V = push to AIV, V→C = pop from AIV
   // AIV: C→V = pop from AIC, V→C = push to AIC
-  std::string push_op = (side == CoreSide::AIC) ? "system.tpush_to_aiv" : "system.tpush_to_aic";
-  std::string pop_op = (side == CoreSide::AIC) ? "system.tpop_from_aiv" : "system.tpop_from_aic";
+  std::string push_op = (side == CoreSide::AIC) ? "tile.tpush_to_aiv" : "tile.tpush_to_aic";
+  std::string pop_op = (side == CoreSide::AIC) ? "tile.tpop_from_aiv" : "tile.tpop_from_aic";
   // AIC pushes on C→V and pops on V→C; AIV is the reverse
   CVDirection push_direction =
       (side == CoreSide::AIC) ? CVDirection::CUBE_TO_VECTOR : CVDirection::VECTOR_TO_CUBE;
