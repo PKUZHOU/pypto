@@ -775,9 +775,9 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   }
 
   auto group_body = SeqStmts::Flatten(std::move(group_stmts), func->span_);
-  auto group_func =
-      std::make_shared<Function>(group_name, group_params, func->param_directions_, func->return_types_,
-                                 group_body, func->span_, FunctionType::Group);
+  auto group_func = std::make_shared<Function>(group_name, group_params, func->param_directions_,
+                                               func->return_types_, group_body, func->span_,
+                                               FunctionType::Group, std::nullopt, std::nullopt, func->attrs_);
 
   return {aic_func, aiv_func, group_func};
 }
@@ -831,7 +831,8 @@ FunctionPtr RewriteGroupCaller(const FunctionPtr& group_func, const std::string&
   auto new_body = SeqStmts::Flatten(std::move(new_stmts), group_func->span_);
   auto result =
       std::make_shared<Function>(group_func->name_, group_func->params_, group_func->param_directions_,
-                                 group_func->return_types_, new_body, group_func->span_, FunctionType::Group);
+                                 group_func->return_types_, new_body, group_func->span_, FunctionType::Group,
+                                 group_func->level_, group_func->role_, group_func->attrs_);
   return result;
 }
 
@@ -1141,6 +1142,12 @@ Pass ExpandMixedKernel() {
                                                     std::nullopt, std::nullopt, func->attrs_);
         new_functions.push_back(converted);
         continue;
+      }
+      // Warn if split unset or is NONE — don't supported by pto-isa now.
+      auto split_mode = func->GetSplitMode();
+      if (!split_mode.has_value() || *split_mode == SplitMode::None) {
+        LOG_ERROR << "Mixed kernel '" << func->name_ << "' use none split mode not supported by isa now; "
+                  << "consider using split=pl.SplitMode.UP_DOWN on its auto_incore scope";
       }
 
       // Expand mixed kernel — skip Group wrapper if an existing Group caller exists
