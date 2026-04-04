@@ -20,6 +20,7 @@ from typing import Any, TypeAlias, TypeVar, cast, overload
 
 from pypto.pypto_core import ir
 
+from ..distributed import DistributedProgram, register_distributed_program
 from .ast_parser import ASTParser
 from .diagnostics import ParserError, ParserSyntaxError, concise_error_message
 from .enum_utils import FUNCTION_TYPE_MAP, LEVEL_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
@@ -802,6 +803,13 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
     closure_vars = {**caller_frame.f_globals, **caller_frame.f_locals}
 
     def _decorator(c: type) -> ir.Program:
+        distributed_meta = getattr(c, "DISTRIBUTED", None)
+        if distributed_meta is not None and not isinstance(distributed_meta, DistributedProgram):
+            raise ParserSyntaxError(
+                f"Class attribute DISTRIBUTED on '{c.__name__}' must be pl.DistributedProgram",
+                hint="Use pl.DistributedProgram(...) for distributed program metadata",
+            )
+
         # Get source code and file information
         source_file, source_lines_raw, starting_line = _get_source_info(c, "class")
         source_code = "".join(source_lines_raw)
@@ -926,6 +934,9 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             # Create Program with class name and span
             program_span = ir.Span(source_file, starting_line, col_offset)
             prog = ir.Program(all_functions, c.__name__, program_span)
+
+            if distributed_meta is not None:
+                register_distributed_program(prog, distributed_meta)
 
             return prog
 

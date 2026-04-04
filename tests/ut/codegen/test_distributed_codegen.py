@@ -11,7 +11,8 @@
 
 import pypto.language as pl
 import pytest
-from pypto import codegen, passes
+from pypto import backend, codegen, ir, passes
+from pypto.backend import BackendType
 
 
 class TestDistributedCodegen:
@@ -177,6 +178,79 @@ class TestDistributedCodegen:
         # HOST = level 3, so we expect kNumL3
         assert "kNumL3" in code
         assert "env_int" in code
+
+    def test_distributed_phase_codegen_without_embedded_cpp(self, tmp_path):
+        """Declarative distributed phases generate orchestration and collective code in backend."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class DistributedProgram:
+            DISTRIBUTED = pl.DistributedProgram(
+                phases=[
+                    pl.DistributedLocalPhase(local_func="local_phase", orch_func="dist_phase1"),
+                    pl.DistributedAllReducePhase(
+                        input_name="partial_out",
+                        output_name="output",
+                        orch_func="dist_phase2",
+                        barrier_before=True,
+                    ),
+                ],
+                orchestration_source_name="dist_orch",
+                buffer_attrs=[pl.BufferAttr("partial_out", placement="window", data_prefix_elems=4)],
+                inputs=["x", "w"],
+                outputs=["output"],
+            )
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def vec_add(
+                self,
+                x: pl.Tensor[[4, 16], pl.FP32],
+                w: pl.Tensor[[4, 16], pl.FP32],
+                partial_out: pl.Out[pl.Tensor[[4, 16], pl.FP32]],
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [4, 16])
+                w_tile = pl.load(w, [0, 0], [4, 16])
+                out_tile = pl.add(x_tile, w_tile)
+                return pl.store(out_tile, [0, 0], partial_out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def local_phase(
+                self,
+                x: pl.Tensor[[4, 16], pl.FP32],
+                w: pl.Tensor[[4, 16], pl.FP32],
+                partial_out: pl.Out[pl.Tensor[[4, 16], pl.FP32]],
+            ) -> pl.Tensor[[4, 16], pl.FP32]:
+                partial_out = self.vec_add(x, w, partial_out)
+                return partial_out
+
+        out_dir = ir.compile(
+            DistributedProgram,
+            output_dir=str(tmp_path),
+            dump_passes=False,
+            skip_ptoas=True,
+            backend_type=BackendType.Ascend910B,
+        )
+
+        dist_orch = (tmp_path / "orchestration" / "dist_orch.cpp").read_text(encoding="utf-8")
+        allreduce_kernel = (tmp_path / "kernels" / "aiv" / "dist_phase2_kernel.cpp").read_text(encoding="utf-8")
+
+        assert out_dir == str(tmp_path)
+        assert "void dist_phase1(PTO2Runtime* rt" in dist_orch
+        assert "void dist_phase2(" in dist_orch
+        assert "PTO2_SCOPE(rt)" in dist_orch
+        assert "pto2_rt_submit_aiv_task(rt, " in dist_orch
+        assert "from_tensor_arg(orch_args.tensor(0));" in dist_orch
+        assert "reinterpret_cast<void*>(orch_args.scalar(0))" in dist_orch
+        assert "reinterpret_cast<void*>(orch_args.scalar(1))" in dist_orch
+        assert "uint64_t nranks = orch_args.scalar(2);" in dist_orch
+        assert "uint64_t root = orch_args.scalar(3);" in dist_orch
+        assert "uint64_t device_ctx = orch_args.scalar(4);" in dist_orch
+        assert "input_tensor->ndims == 0 || output_tensor->ndims != input_tensor->ndims" in allreduce_kernel
+        assert "output_tensor->shapes[i] != input_tensor->shapes[i]" in allreduce_kernel
+        assert "total_elems *= static_cast<uint64_t>(input_tensor->shapes[i]);" in allreduce_kernel
+        assert "ALLREDUCE_CHUNK = 256" in allreduce_kernel
 
 
 if __name__ == "__main__":

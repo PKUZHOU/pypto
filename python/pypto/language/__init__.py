@@ -55,6 +55,18 @@ from pypto.pypto_core.ir import (
 )
 
 from . import parser
+from .distributed import (
+    BufferAttr,
+    DistributedAllReducePhase,
+    DistributedLocalPhase,
+    DistributedPhase,
+    DistributedProgram,
+    DistributedRuntime,
+    ExternalKernel,
+    PhaseArg,
+    scalar_arg,
+    tensor_arg,
+)
 from .dsl_api import (
     at,
     auto_incore,
@@ -209,6 +221,16 @@ __all__ = [
     "loads",
     "parse_program",
     "loads_program",
+    "DistributedProgram",
+    "DistributedPhase",
+    "DistributedLocalPhase",
+    "DistributedAllReducePhase",
+    "DistributedRuntime",
+    "BufferAttr",
+    "ExternalKernel",
+    "PhaseArg",
+    "tensor_arg",
+    "scalar_arg",
     "Tensor",
     "Tile",
     "Scalar",

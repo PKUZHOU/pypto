@@ -42,6 +42,7 @@ import functools
 import importlib
 import os
 import pprint
+import runpy
 import subprocess
 import sys
 import time
@@ -668,25 +669,47 @@ def _append_default_distributed_config(
     if "DISTRIBUTED_CONFIG" in content:
         return
 
+    kcfg = runpy.run_path(str(config_path))
+    dist_spec = kcfg.get("DISTRIBUTED_SPEC") or {}
+    buffer_attrs = dict(dist_spec.get("buffer_attrs", {}))
+
+    buffers: list[dict[str, Any]] = []
+    for spec in tensor_specs:
+        merged = {
+            "name": spec.name,
+            "dtype": _torch_dtype_to_distributed_dtype(spec.dtype),
+            "count": int(torch.Size(spec.shape).numel()),
+            "shape": [int(dim) for dim in spec.shape],
+            "placement": spec.placement,
+        }
+        attrs = buffer_attrs.get(spec.name, {})
+        placement_override = attrs.get("placement")
+        if placement_override is not None:
+            merged["placement"] = placement_override
+        prefix_elems = int(attrs.get("data_prefix_elems", 0) or 0)
+        if prefix_elems > 0:
+            merged["data_prefix_elems"] = prefix_elems
+        buffers.append(merged)
+
     dist_config: dict[str, Any] = {
         "nranks": config.nranks,
         "root": config.root,
-        "win_sync_prefix": config.win_sync_prefix,
-        "buffers": [
-            {
-                "name": spec.name,
-                "dtype": _torch_dtype_to_distributed_dtype(spec.dtype),
-                "count": int(torch.Size(spec.shape).numel()),
-                "placement": spec.placement,
-            }
-            for spec in tensor_specs
-        ],
-        "inputs": [spec.name for spec in tensor_specs if not spec.is_output],
-        "outputs": [spec.name for spec in tensor_specs if spec.is_output],
-        "args": config.distributed_args or [spec.name for spec in tensor_specs],
+        "win_sync_prefix": int(dist_spec.get("win_sync_prefix", config.win_sync_prefix)),
+        "buffers": buffers,
+        "inputs": list(dist_spec.get("inputs", [spec.name for spec in tensor_specs if not spec.is_output])),
+        "outputs": list(dist_spec.get("outputs", [spec.name for spec in tensor_specs if spec.is_output])),
+        "args": list(dist_spec.get("args", config.distributed_args or [spec.name for spec in tensor_specs])),
     }
-    if config.comm_include_dirs:
-        dist_config["comm_include_dirs"] = list(config.comm_include_dirs)
+    phases = dist_spec.get("phases")
+    if phases:
+        dist_config["phases"] = list(phases)
+
+    merged_comm_include_dirs = list(dist_spec.get("comm_include_dirs", []))
+    for include_dir in config.comm_include_dirs:
+        if include_dir not in merged_comm_include_dirs:
+            merged_comm_include_dirs.append(include_dir)
+    if merged_comm_include_dirs:
+        dist_config["comm_include_dirs"] = merged_comm_include_dirs
 
     extra = "\n\nDISTRIBUTED_CONFIG = " + pprint.pformat(dist_config, width=100) + "\n"
     config_path.write_text(content + extra, encoding="utf-8")
@@ -703,11 +726,21 @@ def _execute_distributed(
 ) -> None:
     """Invoke Simpler's DistributedCodeRunner for multi-rank execution."""
     simpler_root = os.environ.get("SIMPLER_ROOT")
+    candidate_roots: list[Path] = []
     if simpler_root:
+        candidate_roots.append(Path(simpler_root))
+    pypto_repo_root = Path(__file__).resolve().parents[3]
+    candidate_roots.append(pypto_repo_root.parent / "simpler")
+    candidate_roots.append(pypto_repo_root / "3rdparty" / "simpler")
+
+    for simpler_candidate in candidate_roots:
+        if not simpler_candidate.exists():
+            continue
         for sub in ("examples/scripts", "python"):
-            p = str(Path(simpler_root) / sub)
+            p = str(simpler_candidate / sub)
             if p not in sys.path:
                 sys.path.insert(0, p)
+        break
 
     DistributedCodeRunner = importlib.import_module("distributed_code_runner").DistributedCodeRunner
     KernelCompiler = importlib.import_module("kernel_compiler").KernelCompiler
