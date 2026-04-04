@@ -35,10 +35,13 @@ Typical usage::
     print(result)  # PASS / FAIL: ...
 """
 
+from __future__ import annotations
+
 import ctypes
 import functools
 import importlib
 import os
+import pprint
 import subprocess
 import sys
 import time
@@ -267,6 +270,13 @@ class RunConfig:
     enable_profiling: bool = False
     warning_level: WarningLevel | None = None
     disabled_warnings: WarningCheckSet | None = None
+    nranks: int = 1
+    root: int = 0
+    device_ids: list[int] | None = None
+    win_sync_prefix: int = 256
+    distributed_args: list[str] | None = None
+    comm_include_dirs: list[str] = field(default_factory=list)
+    artifact_patch_fn: Callable[[Path, list[TensorSpec], RunConfig], None] | None = None
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
@@ -283,6 +293,16 @@ class RunConfig:
         # can reference kernel_config.py.  Enable save_kernels automatically.
         if self.enable_profiling and not self.save_kernels:
             self.save_kernels = True
+        if self.nranks <= 0:
+            raise ValueError(f"nranks must be positive, got {self.nranks}")
+        if self.root < 0 or self.root >= self.nranks:
+            raise ValueError(f"root must be in [0, {self.nranks}), got {self.root}")
+        if self.device_ids is not None and len(self.device_ids) != self.nranks:
+            raise ValueError(
+                f"device_ids length must match nranks ({self.nranks}), got {len(self.device_ids)}"
+            )
+        if self.nranks > 1 and self.enable_profiling:
+            raise NotImplementedError("Distributed profiling is not supported by pypto.runtime.run() yet")
 
 
 @dataclass
@@ -417,19 +437,46 @@ def run(
             disabled_warnings=config.disabled_warnings,
         )
 
+        if config.artifact_patch_fn is not None:
+            config.artifact_patch_fn(work_dir, tensor_specs, config)
+
+        if config.nranks > 1:
+            _append_default_distributed_config(work_dir, tensor_specs, config)
+
         # 3. Write golden.py
         golden_path = work_dir / "golden.py"
-        write_golden(tensor_specs, golden, golden_path, rtol=config.rtol, atol=config.atol)
-
-        # 4. Execute via Simpler's CodeRunner
-        _execute_on_device(
-            work_dir,
+        write_golden(
+            tensor_specs,
+            golden,
             golden_path,
-            config.platform,
-            config.device_id,
-            config.pto_isa_commit,
-            config.enable_profiling,
+            rtol=config.rtol,
+            atol=config.atol,
+            distributed=config.nranks > 1,
         )
+
+        if config.codegen_only:
+            return RunResult(passed=True, execution_time=time.time() - start_time)
+
+        # 4. Execute via Simpler's runtime runner
+        if config.nranks > 1:
+            _execute_distributed(
+                work_dir,
+                golden_path,
+                config.platform,
+                config.nranks,
+                config.root,
+                config.device_ids,
+                config.pto_isa_commit,
+            )
+        else:
+            _execute_on_device(
+                work_dir,
+                golden_path,
+                config.platform,
+                config.device_id,
+                config.pto_isa_commit,
+                config.enable_profiling,
+            )
 
         return RunResult(passed=True, execution_time=time.time() - start_time)
 
@@ -576,7 +623,11 @@ def _install_binary_cache_patch(KernelCompiler, RuntimeBuilder) -> None:
         host_file = cache_dir / f"{name}_{self.platform}_host.bin"
         aicpu_file = cache_dir / f"{name}_{self.platform}_aicpu.bin"
         aicore_file = cache_dir / f"{name}_{self.platform}_aicore.bin"
-        if host_file.exists() and aicpu_file.exists() and aicore_file.exists():
+
+        # build=True is used by pypto.runtime.run() because runtime sources in the
+        # current workspace may have changed. Reusing the persistent cache here can
+        # silently serve stale binaries and break source-level debugging/delivery.
+        if not build and host_file.exists() and aicpu_file.exists() and aicore_file.exists():
             return RuntimeBinaries(host_path=host_file, aicpu_path=aicpu_file, aicore_path=aicore_file)
         result = orig_get_binaries(self, name, build=build)
         _save_binary(result.host_path.read_bytes(), host_file)
@@ -586,6 +637,97 @@ def _install_binary_cache_patch(KernelCompiler, RuntimeBuilder) -> None:
 
     RuntimeBuilder.get_binaries = _patched_get_binaries
     _binary_cache_patched[0] = True
+
+
+def _torch_dtype_to_distributed_dtype(dtype: torch.dtype) -> str:
+    mapping = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float64: "float64",
+        torch.int8: "int8",
+        torch.int16: "int16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.uint8: "uint8",
+    }
+    result = mapping.get(dtype)
+    if result is None:
+        raise ValueError(f"Unsupported distributed dtype {dtype!r}")
+    return result
+
+
+def _append_default_distributed_config(
+    work_dir: Path,
+    tensor_specs: list[TensorSpec],
+    config: RunConfig,
+) -> None:
+    """Append a default DISTRIBUTED_CONFIG when the artifact patcher did not provide one."""
+    config_path = work_dir / "kernel_config.py"
+    content = config_path.read_text(encoding="utf-8")
+    if "DISTRIBUTED_CONFIG" in content:
+        return
+
+    dist_config: dict[str, Any] = {
+        "nranks": config.nranks,
+        "root": config.root,
+        "win_sync_prefix": config.win_sync_prefix,
+        "buffers": [
+            {
+                "name": spec.name,
+                "dtype": _torch_dtype_to_distributed_dtype(spec.dtype),
+                "count": int(torch.Size(spec.shape).numel()),
+                "placement": spec.placement,
+            }
+            for spec in tensor_specs
+        ],
+        "inputs": [spec.name for spec in tensor_specs if not spec.is_output],
+        "outputs": [spec.name for spec in tensor_specs if spec.is_output],
+        "args": config.distributed_args or [spec.name for spec in tensor_specs],
+    }
+    if config.comm_include_dirs:
+        dist_config["comm_include_dirs"] = list(config.comm_include_dirs)
+
+    extra = "\n\nDISTRIBUTED_CONFIG = " + pprint.pformat(dist_config, width=100) + "\n"
+    config_path.write_text(content + extra, encoding="utf-8")
+
+
+def _execute_distributed(
+    work_dir: Path,
+    golden_path: Path,
+    platform: str,
+    nranks: int,
+    root: int,
+    device_ids: list[int] | None,
+    pto_isa_commit: str | None = None,
+) -> None:
+    """Invoke Simpler's DistributedCodeRunner for multi-rank execution."""
+    simpler_root = os.environ.get("SIMPLER_ROOT")
+    if simpler_root:
+        for sub in ("examples/scripts", "python"):
+            p = str(Path(simpler_root) / sub)
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
+    DistributedCodeRunner = importlib.import_module("distributed_code_runner").DistributedCodeRunner
+    KernelCompiler = importlib.import_module("kernel_compiler").KernelCompiler
+    RuntimeBuilder = importlib.import_module("runtime_builder").RuntimeBuilder
+    _install_binary_cache_patch(KernelCompiler, RuntimeBuilder)
+
+    ok = DistributedCodeRunner(
+        kernels_dir=str(work_dir),
+        golden_path=str(golden_path),
+        platform=platform,
+        nranks=nranks,
+        device_ids=device_ids,
+        root=root,
+        build_dir=str(work_dir / "distributed_build"),
+        artifact_dir=str(work_dir / "distributed_artifacts"),
+        clone_protocol="https",
+        pto_isa_commit=pto_isa_commit,
+    ).run_all()
+    if not ok:
+        raise RuntimeError("Distributed execution or verification failed")
 
 
 def _execute_on_device(

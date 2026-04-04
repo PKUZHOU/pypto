@@ -7,11 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# Auto-update git submodules if not initialized
+set(MSGPACK_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/msgpack-c")
+
+# Auto-update git submodules only when the vendored source directory is missing.
 find_package(Git QUIET)
 
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/.git")
+if(NOT EXISTS "${MSGPACK_SOURCE_DIR}/include/msgpack.hpp")
+    if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
         message(STATUS "Initializing msgpack-c git submodule...")
         execute_process(
             COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
@@ -26,7 +28,6 @@ if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
 endif()
 
 # Set up msgpack-c (header-only library)
-set(MSGPACK_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/msgpack-c")
 
 if(NOT EXISTS "${MSGPACK_SOURCE_DIR}/include/msgpack.hpp")
     message(FATAL_ERROR "msgpack-c submodule not found. Please run: git submodule update --init --recursive")

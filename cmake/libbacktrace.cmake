@@ -7,12 +7,16 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# Auto-update git submodules if not initialized
+set(LIBBACKTRACE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/libbacktrace")
+set(LIBBACKTRACE_INSTALL_DIR "${CMAKE_BINARY_DIR}/3rdparty/libbacktrace")
+set(LIBBACKTRACE_BUILD_DIR "${CMAKE_BINARY_DIR}/3rdparty/libbacktrace/build")
+
+# Auto-update git submodules only when the vendored source directory is missing.
 find_package(Git QUIET)
 
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/3rdparty/libbacktrace/.git")
-        message(STATUS "Initializing git submodules...")
+if(NOT EXISTS "${LIBBACKTRACE_SOURCE_DIR}/backtrace.h")
+    if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+        message(STATUS "Initializing git submodules for libbacktrace...")
         execute_process(
             COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -25,12 +29,12 @@ if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
     endif()
 endif()
 
+if(NOT EXISTS "${LIBBACKTRACE_SOURCE_DIR}/backtrace.h")
+    message(FATAL_ERROR "libbacktrace source not found at ${LIBBACKTRACE_SOURCE_DIR}")
+endif()
+
 # Set up libbacktrace as an external project
 include(ExternalProject)
-
-set(LIBBACKTRACE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/libbacktrace")
-set(LIBBACKTRACE_INSTALL_DIR "${CMAKE_BINARY_DIR}/3rdparty/libbacktrace")
-set(LIBBACKTRACE_BUILD_DIR "${CMAKE_BINARY_DIR}/3rdparty/libbacktrace/build")
 
 # Create installation directories
 file(MAKE_DIRECTORY ${LIBBACKTRACE_INSTALL_DIR}/include)

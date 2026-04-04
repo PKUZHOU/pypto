@@ -66,6 +66,7 @@ def write_golden(
     rtol: float = 1e-5,
     atol: float = 1e-5,
     scalar_specs: list[ScalarSpec] | None = None,
+    distributed: bool = False,
 ) -> Path:
     """Generate and write a ``golden.py`` file for Simpler's CodeRunner.
 
@@ -83,7 +84,14 @@ def write_golden(
     Returns:
         The resolved ``output_path`` after writing.
     """
-    content = generate_golden_source(tensor_specs, golden_fn, rtol, atol, scalar_specs=scalar_specs)
+    content = generate_golden_source(
+        tensor_specs,
+        golden_fn,
+        rtol,
+        atol,
+        scalar_specs=scalar_specs,
+        distributed=distributed,
+    )
     output_path = Path(output_path)
     output_path.write_text(content, encoding="utf-8")
     return output_path
@@ -97,6 +105,7 @@ def generate_golden_source(
     *,
     compute_golden_src: str | None = None,
     scalar_specs: list[ScalarSpec] | None = None,
+    distributed: bool = False,
 ) -> str:
     """Build the full content of golden.py as a string.
 
@@ -134,7 +143,7 @@ def generate_golden_source(
     # Pre-compute init expressions so that helper function preambles (e.g. for
     # callable init_values) are collected before we start building the output.
     preambles: dict[str, str] = {}
-    init_exprs = [_init_expr(spec, preambles) for spec in tensor_specs]
+    init_exprs = [_init_expr(spec, preambles, distributed=distributed) for spec in tensor_specs]
 
     lines: list[str] = [
         '"""',
@@ -158,8 +167,13 @@ def generate_golden_source(
         lines.extend(preamble.splitlines())
 
     lines.append("")
-    lines.append("def generate_inputs(params):")
-    lines.append('    """Generate inputs as a list of (name, value) tuples."""')
+    if distributed:
+        lines.append("def generate_distributed_inputs(rank, nranks, root, comm_ctx=None):")
+        lines.append('    """Generate per-rank inputs as a list of (name, value) tuples."""')
+        lines.append("    del comm_ctx")
+    else:
+        lines.append("def generate_inputs(params):")
+        lines.append('    """Generate inputs as a list of (name, value) tuples."""')
 
     # Tensor variable declarations
     for spec, expr in zip(tensor_specs, init_exprs, strict=True):
@@ -177,6 +191,16 @@ def generate_golden_source(
     for spec in scalars:
         lines.append(f'        ("{spec.name}", {spec.name}),')
     lines.append("    ]")
+    if distributed:
+        lines.append("")
+        lines.append("")
+        lines.append("def generate_inputs(params):")
+        lines.append('    """Compatibility wrapper delegating to rank-aware input generation."""')
+        lines.append("    params = params or {}")
+        lines.append('    rank = int(params.get("rank", 0))')
+        lines.append('    nranks = int(params.get("nranks", 1))')
+        lines.append('    root = int(params.get("root", 0))')
+        lines.append("    return generate_distributed_inputs(rank, nranks, root)")
     lines.append("")
     lines.append("")
 
@@ -200,7 +224,7 @@ def _compute_golden_imports(compute_golden_src: str) -> list[str]:
     ]
 
 
-def _init_expr(spec: TensorSpec, preambles: dict[str, str]) -> str:
+def _init_expr(spec: TensorSpec, preambles: dict[str, str], *, distributed: bool = False) -> str:
     """Return the Python expression (string) used to initialise this tensor in golden.py.
 
     For callable init_values that are not built-in factories, the function
@@ -223,15 +247,16 @@ def _init_expr(spec: TensorSpec, preambles: dict[str, str]) -> str:
         return _tensor_literal_expr(iv, shape_str, dtype_str)
 
     if callable(iv):
-        # Try to extract source (works for named functions with valid identifiers).
-        expr = _extract_callable_expr(iv, preambles)
-        if expr is not None:
-            return f"torch.as_tensor({expr}, dtype={dtype_str})"
         # Fallback for C builtins (torch.randn etc.) whose source is not
         # available via inspect.
         factory_name = _KNOWN_FACTORIES.get(iv)
         if factory_name is not None:
             return f"{factory_name}({shape_str}, dtype={dtype_str})"
+        # Try to extract source (works for named functions with valid identifiers).
+        expr = _extract_callable_expr(iv, preambles)
+        if expr is not None:
+            call_expr = _callable_init_expr(iv, expr, shape_str, dtype_str, distributed=distributed)
+            return f"torch.as_tensor({call_expr}, dtype={dtype_str})"
         raise ValueError(
             f"Callable init_value {iv!r} for tensor {spec.name!r} is not supported by "
             "golden_writer. Use a scalar, a torch.Tensor, a named function, "
@@ -271,6 +296,63 @@ def _tensor_literal_expr(tensor: torch.Tensor, shape_str: str, dtype_str: str) -
         "        return torch.arange(0, 2048, dtype=torch.int32)\n"
         '    TensorSpec("name", shape, dtype, init_value=make_tensor)'
     )
+
+
+def _callable_init_expr(
+    fn: Callable,
+    fn_expr: str,
+    shape_str: str,
+    dtype_str: str,
+    *,
+    distributed: bool,
+) -> str:
+    """Build the callable invocation emitted into generated golden.py."""
+    fn_name = fn_expr[:-2] if fn_expr.endswith("()") else fn_expr
+    available = {
+        "shape": shape_str,
+        "dtype": dtype_str,
+    }
+    if distributed:
+        available.update(
+            {
+                "rank": "rank",
+                "nranks": "nranks",
+                "root": "root",
+            }
+        )
+
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return f"{fn_name}()"
+
+    args: list[str] = []
+    kwargs: list[str] = []
+    used_names: set[str] = set()
+    accepts_var_kwargs = False
+
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            continue
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            accepts_var_kwargs = True
+            continue
+        expr = available.get(param.name)
+        if expr is None:
+            continue
+        used_names.add(param.name)
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            args.append(expr)
+        else:
+            kwargs.append(f"{param.name}={expr}")
+
+    if accepts_var_kwargs:
+        for name, expr in available.items():
+            if name not in used_names:
+                kwargs.append(f"{name}={expr}")
+
+    call_args = ", ".join([*args, *kwargs])
+    return f"{fn_name}({call_args})"
 
 
 def _extract_callable_expr(fn: Callable, preambles: dict[str, str]) -> str | None:

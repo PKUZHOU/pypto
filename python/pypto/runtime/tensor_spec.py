@@ -14,6 +14,7 @@ Provides TensorSpec, which describes a single tensor's name, shape, dtype,
 initialisation strategy, and whether it is an output to be validated.
 """
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,8 +53,22 @@ class TensorSpec:
     dtype: torch.dtype
     init_value: int | float | torch.Tensor | Callable | None = field(default=None)
     is_output: bool = False
+    placement: str = "device"
 
-    def create_tensor(self) -> torch.Tensor:
+    def __post_init__(self) -> None:
+        if self.placement not in {"device", "window"}:
+            raise ValueError(
+                f"Unsupported placement {self.placement!r} for tensor {self.name!r}. "
+                "Expected 'device' or 'window'."
+            )
+
+    def create_tensor(
+        self,
+        *,
+        rank: int = 0,
+        nranks: int = 1,
+        root: int = 0,
+    ) -> torch.Tensor:
         """Create and return a ``torch.Tensor`` based on this specification.
 
         Returns:
@@ -70,10 +85,79 @@ class TensorSpec:
             fn = self.init_value
             if fn in (torch.randn, torch.rand, torch.zeros, torch.ones):
                 return fn(self.shape, dtype=self.dtype)
-            # Generic callable: call with no arguments, then cast
-            result: Any = fn()
+            # Generic callable: pass through any distributed init context the
+            # callable explicitly declares, then cast to the requested dtype.
+            result: Any = _invoke_init_callable(
+                fn,
+                shape=self.shape,
+                dtype=self.dtype,
+                rank=rank,
+                nranks=nranks,
+                root=root,
+            )
             return torch.as_tensor(result, dtype=self.dtype)
         raise TypeError(f"Unsupported init_value type {type(self.init_value)!r} for tensor {self.name!r}")
+
+
+def _invoke_init_callable(
+    fn: Callable,
+    *,
+    shape: list[int],
+    dtype: torch.dtype,
+    rank: int,
+    nranks: int,
+    root: int,
+) -> Any:
+    """Invoke an init callable using only the context it declares.
+
+    Supported parameter names:
+      - ``shape``
+      - ``dtype``
+      - ``rank``
+      - ``nranks``
+      - ``root``
+
+    Callables that declare none of these parameters are invoked with no
+    arguments to preserve the previous runtime behaviour.
+    """
+    available = {
+        "shape": shape,
+        "dtype": dtype,
+        "rank": rank,
+        "nranks": nranks,
+        "root": root,
+    }
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn()
+
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    used_names: set[str] = set()
+    accepts_var_kwargs = False
+
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            continue
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            accepts_var_kwargs = True
+            continue
+        if param.name not in available:
+            continue
+        value = available[param.name]
+        used_names.add(param.name)
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            args.append(value)
+        else:
+            kwargs[param.name] = value
+
+    if accepts_var_kwargs:
+        for name, value in available.items():
+            if name not in used_names:
+                kwargs[name] = value
+
+    return fn(*args, **kwargs)
 
 
 # ctypes type name → ctypes constructor name used in generated golden.py
